@@ -1,59 +1,62 @@
 /*
- * APKey_Hide —— APatch / KernelPatch supercall 鉴权泄漏防护
+ * APKey_Hide —— 让 KernelPatch 的 supercall 接口对非受信调用者不可观测
  *
  *   模块名 : APKey_Hide
+ *   版  本 : 3.2.0
  *   作  者 : Lun.
  *   许  可 : MIT
- *   平  台 : Android arm64（KernelPatch / APatch 之上）
+ *   平  台 : Android arm64（KernelPatch / APatch / 派生分支之上）
  *
- * ---------------------------------------------------------------------------
- * v2.1：v2.0 链式架构 + 页侧信道守卫（G2）。两条检测通道同时关闭。
- * ---------------------------------------------------------------------------
+ * ==========================================================================
+ * 设计（v3.2.4：钩住 KP 的排除判定函数，按调用者当场裁决）
+ * ==========================================================================
+ * v3.1 的区间枚举排除有一个已被真机实测证实的漏洞：它只能排除"当前已知的
+ * uid 区间"。实测：区间 [1,20000) 排除后，uid=90000（Android isolatedProcess
+ * 就是这一段的）依然拿到 `key=[su]` —— 一个没有 root 的普通应用只要用
+ * isolatedProcess 起一个 service 就换到全新 uid，直接读走真实 superkey。
+ * 任何"枚举区间"的写法都追不上 uid 空间的形态（isolated 9xxxx、多用户 10xxxx）。
  *
- * 【检测器的两条通道与对应防线】
+ * v3.2 改为**在 KP 的判定函数上当场裁决**：
  *
- *  A. 返回值通道（主判据）：KP 的信息类命令（HELLO/VER/KLOG…）在鉴权门
- *     （supercall.c `if (!is_authed) return -EPERM`）之前，任意 uid 可拿
- *     kpver/magic。⇒ nr45 链上观察 KP 裁决（skip_origin/ret），未受信者
- *     净化为原生 truncate 语义。
+ *   KP 的 supercall before() 第一行是
+ *       int uid = current_uid();
+ *       if (get_ap_mod_exclude(uid)) return;      ← supercall.c:391-393
+ *   本模块 inline hook 掉 KP 导出的 get_ap_mod_exclude(uid)：
+ *       · 受信 uid（下面定义的信任集）→ 返回原值 0（放行，KP 照常鉴权）
+ *       · 其余所有 uid（含 9xxxx isolated、10xxxx 多用户、未来任何新段）
+ *         → 直接返回 1 ⇒ KP 立刻 return：不读 key、不鉴权、不分发、
+ *           不写缓冲区、不产生任何副作用；调用者看到的就是原生 truncate
+ *           语义（例如 syscall(45, "su", 0x100a) → -ENOENT，与无 KP 的
+ *           内核完全一致）。
  *
- *  B. 内存页通道（辅助判据）：KP before() 判信任**之前**就
- *     compat_strncpy_from_user(key, x0) —— 检测器用懒分配页（VMA 有、
- *     PTE 无）当 x0，调用后 mincore 查页是否被换入；换入 ⇒ 只有 KP 读过。
- *     本模块 nr45 钩子跑在 KP（链槽 0）之后，页已被读 ⇒ 必须钩更底层：
- *     compat_strncpy_from_user 本身（KP 全局唯一用户字符串读取原语）。
+ * 信任集 = { uid 0（root，恢复通道） }
+ *        ∪ { 加载者（仅在特权域完成一次精确修正之前临时放行） }
+ *        ∪ { 名字校验过的管理器（按 packages.list 的 包名↔uid 映射确定） }
+ *        ∪ { ctl0 allow= 显式放行的 uid（逃生口） }
  *
- * 【G2 为什么逐字节等价、不破坏兼容】
- *   懒页内容恒为全 0：内核真读它 = 空串 = strncpy_from_user 返回 0，
- *   KP 走 `if (len <= 0) return;` 正常失败分支。G2 对「未受信 uid + 页
- *   确信缺失」直接返回 0 —— 返回值与控制流完全一致，唯一差别是页没有被
- *   换入（这正是要隐藏的副作用）。合法客户端的密钥串必须写入过页才可能
- *   鉴权 ⇒ 页必然 present ⇒ 原样放行，零干扰。
- *   KP 判定未受信 ⇒ skip_origin=0 ⇒ 原生 truncate 照跑：
- *     x1<0 → 干净内核不读 x0、返回 -EINVAL；G2 短路后同样一字不读 ⇒ 0→0。
- *     x1>=0 → 原生 getname(x0) 本来就会把页换入 ⇒ 有→有，无差异。
+ * 为什么这样不可检测（逐条对应此前红队清单）：
+ *   V1 缓冲区取证：KP 在读 key 之前就返回 ⇒ 不会写任何调用者缓冲区。
+ *   V2 KPM 枚举：模块列表本身就是 KP 的，本模块不新增可枚举面。
+ *   V3 自我授权：非受信者一律被排除，伪造请求只会得到原生语义。
+ *   V4 副作用 oracle：无鉴权、无分发、无日志（release 版零 printk）。
+ *   V5 ctl0：非信任集到不了（KP 直接 -EPERM；本模块 ctl0 亦按信任集准入）。
+ *   V6 页信道：key 页不会被换入。
+ *   V7 返回值 oracle：返回原生 truncate 语义。
+ *   ★uid 维度：不再依赖"枚举哪些 uid"，因此 isolatedProcess / 多用户 /
+ *     未来新 uid 段全部天然覆盖 —— 这是 v3.1 → v3.2 的核心修复。
  *
- * 【误判防线（v0.5.3 事故教训，缺一不可）】
- *   1) 页表研判经 oracle 武装（walk_ver）："调用者 PC 页必然 present"，
- *      遍历说它不可用 ⇒ 标定错了 ⇒ 永久 fail-open，G2 永不拦截；
- *   2) apk_user_page_absent：任何不确定一律视为"可用"（放行读取）；
- *   3) uid ∈ 学习集∪白名单（root/管理器/已鉴权者）永不受影响；
- *   4) 安装/标定任一失败 ⇒ g2_on 自动归 0，模块其余功能照常。
+ * 符号面（均已在真机 boot 镜像的 KP 导出表里实测存在）：
+ *   get_ap_mod_exclude / set_ap_mod_exclude / hook / unhook / current_uid；
+ *   printk / scnprintf / copy_to_user / vmalloc / vfree / filp_open /
+ *   kernel_read / filp_close 走 kallsyms 运行时解析，缺失只降级。
  *
- * 【学习型鉴权（继承 v2.0.1，不可伪造）】
- *   判据 = "鉴权门后的命令返回 ret >= 0"（superkey 或本机 trusted_manager
- *   才可能）。SU 族/HELLO/VER 等门前命令绝不作学习判据。
- *
- * 【符号面】extern 仅 5 个，与 v2.0.1（已在原版 APatch 真机加载成功）完全
- *   一致：current_uid / has_syscall_wrapper / fp_wrap_syscalln /
- *   fp_unwrap_syscalln / kallsyms_lookup_name。
- *   hook / unhook / compat_strncpy_from_user / printk / scnprintf /
- *   copy_to_user / copy_from_kernel_nofault 等一律 kallsyms 运行时解析，
- *   缺失只降级，不造成加载失败。
- * ---------------------------------------------------------------------------
- * 
- * 
- * 
+ * 已知边界（诚实）：
+ *   · 排除是 kstorage/hook 级状态 ⇒ 每 boot 重来一次，需每次开机重新加载；
+ *   · 管理器身份依赖 packages.list（只有特权域读得了）⇒ 管理员加载模块时
+ *     init 不做修正，"加载者"先按临时信任放行，等 root 域的一次 supercall
+ *     （例如 root 跑任何 KP 命令）自动完成修正；修正后加载者不再是管理器的
+ *     话会被重新拒绝（堵掉"任何 app 抢先用公开钥匙加载一次即永久受信"）；
+ *   · 文件层痕迹（.kpm 落在可读目录等）不在本模块职责内。
  */
 
 #include <compiler.h>
@@ -63,219 +66,505 @@
 #include <stdbool.h>
 #include <common.h>
 #include <linux/kernel.h>
+#include <linux/err.h>
 #include <kputils.h>          /* current_uid */
-#include <hook.h>             /* hook_fargs6_t */
-#include <syscall.h>          /* fp_hook_syscalln / syscall_args */
 #include <ksyms.h>
 #include <kallsyms.h>
+#include <hook.h>             /* hook() / unhook() */
 #include <baselib.h>
-#include <asm/ptrace.h>       /* struct pt_regs（oracle 用调用者 pc） */
 #include <uapi/asm-generic/errno.h>
 
 KPM_NAME("APKey_Hide");
-KPM_VERSION("2.1.4");
+KPM_VERSION("3.2.0");
 KPM_LICENSE("MIT");
 KPM_AUTHOR("Lun.");
-KPM_DESCRIPTION("suppress KernelPatch supercall param-page reads;https://github.com/Lun-OS/APKey_Hide_KPM");
+KPM_DESCRIPTION("不要嵌入boot!Don't embed boot!;https://github.com/Lun-OS/APKey_Hide_KPM");
 
 /* ========================== 常量 ========================== */
-#define APK_NR_SUPERCALL    45
-#define APK_CMD_MIN         0x1000
-#define APK_CMD_MAX         0x1200
-#define APK_VER_MAX         0xFFFFFFu
-#define APK_LEARN_MAX       8
-#define APK_ALLOW_MAX       8
-#define APK_XX_MAGIC        0x1158u   /* 仅作学习参考值，不作信任判据 */
-
-/* 页表研判（移植自 v1.0.0 真机调通版） */
-#define APK_ID_BYTES        64              /* 标定内容比对长度 */
-#define APK_PHYS_MAX        0x4000000000ULL
-#define APK_PHYS_MASK_MAX   0x0000FFFFFFFFF000ULL
-#define APK_PTE_USER        (1ULL << 6)     /* arm64 LPAE AP[1] */
-#define APK_DRAIN_LOOPS     400000000UL     /* 卸载排空在途 stub */
-#define APK_SCFU_KEY_LEN    128             /* G2 count 门控 = MAX_KEY_LEN。审计结论：
-   * KP 里对【任意 uid 无条件】执行的用户页读取只有 supercall before() 的
-   *   compat_strncpy_from_user(key, x0, MAX_KEY_LEN=128) —— 这就是页侧信道
-   *   唯一入口，也是检测器靶点（execve 魔法路径 key 读取 count=SUPER_KEY_LEN=64，
-   *   ≤128 一并覆盖）。其余 scfu 调用点（KLOG=1024 / kpm_load=1024 / su 写…）
-   *   全在 `if(!is_trusted_caller)return` 门后，未授权检测器触发不到 ⇒ 扩大门控
-   *   无收益，反而可能误伤 su_allow app 的 KLOG。故精准锁定 128。 */
+/* 降级模式（钩子装不上时）用的区间：system 段 + user0 应用段 + isolated 段。
+ * 实测依据：adb(2000) 用公开钥匙可读走真实 superkey（SKEY_GET）—— 这正是
+ * "发现 AP 密钥"的通道；排除 2000 后 SKEY_GET/kpver/KPM_LIST 全部 ENOENT，
+ * 且 `su -c id` 仍为 uid=0（su 走 execve 钩子，不经 supercall）。 */
+#define APK_AID_APP_START   10000u          /* 应用段起点 */
+#define APK_AID_EXCL_START  1u
+#define APK_AID_EXCL_END    20000u
+#define APK_AID_ISO_START   90000u          /* Android isolatedProcess 段 */
+#define APK_AID_ISO_END     100000u
+#define APK_PKGL_PATH       "/data/system/packages.list"
+#define APK_PKGL_MAX        (256UL << 10)
+#define APK_MGR_NAME_MAX    6               /* 已知管理器包名槽位 */
+#define APK_ALLOW_MAX       8               /* ctl0 allow= 逃生口槽位 */
+#define APK_REFINE_MAX_TRY  4               /* 特权域修正的最大尝试次数 */
 
 /* ========================== 日志 ========================== */
 static int (*apk_printk)(const char *fmt, ...);
 
 #ifdef APK_DEBUG_LOG
-#define APK_LOG(fmt, ...)                                                        \
-    do {                                                                         \
-        if (apk_printk)                                                          \
-            apk_printk("[APKey_Hide] " fmt, ##__VA_ARGS__);                      \
+#define APK_LOG(fmt, ...)                                                    \
+    do {                                                                     \
+        if (apk_printk)                                                      \
+            apk_printk("[APKey_Hide] " fmt, ##__VA_ARGS__);                  \
     } while (0)
 #else
 #define APK_LOG(fmt, ...) do { } while (0)
 #endif
 
-/* ========================== 基础工具（无 libc） ========================== */
+/* ========================== 符号 ========================== */
+extern int  set_ap_mod_exclude(uid_t uid, int exclude);   /* KP 导出 */
+extern int  get_ap_mod_exclude(uid_t uid);   /* KP 导出；v3.2 被本模块 inline hook */
 
-/* ========================== 架构寄存器 ========================== */
-static inline uint64_t apk_mrs_ttbr0(void)
-{
-    uint64_t v; asm volatile("mrs %0, ttbr0_el1" : "=r"(v)); return v;
-}
-static inline uint64_t apk_mrs_ttbr1(void)
-{
-    uint64_t v; asm volatile("mrs %0, ttbr1_el1" : "=r"(v)); return v;
-}
-static inline uint64_t apk_mrs_tcr(void)
-{
-    uint64_t v; asm volatile("mrs %0, tcr_el1" : "=r"(v)); return v;
-}
-static inline uint64_t apk_mrs_mair(void)
-{
-    uint64_t v; asm volatile("mrs %0, mair_el1" : "=r"(v)); return v;
-}
+static int   (*apk_snprintf)(char *, size_t, const char *, ...);
+static long  (*apk_copy_to_user)(void *, const void *, unsigned long);
+static void  *(*apk_vmalloc)(unsigned long);
+static void  (*apk_vfree)(const void *);
+static void  *(*apk_filp_open)(const char *, int, int);
+static long  (*apk_kernel_read)(void *, void *, unsigned long, loff_t *);
+static int   (*apk_filp_close)(void *, void *);
 
-/* ========================== 可调参数 ========================== */
-static int apk_learn_on = 1;   /* 学习型鉴权 */
-static int apk_purify_on = 1;  /* 返回值净化（通道 A） */
-static int apk_g2_on = 1;      /* 页守卫（通道 B；失败自动降级 0） */
-static int apk_trace;          /* ctl0 trace=1：nr45 现场记录（debug 版） */
-static int apk_g2_failclosed;  /* 白名单模式：标定失败也硬堵非受信 key 读（item-3） */
+/* ========================== 状态 ========================== */
+static uint32_t apk_loader_uid;            /* KPM_INIT 时的 current_uid() */
+static int      apk_swept;                 /* 降级模式：区间排除已下 */
+static int      apk_hook_ok;               /* v3.2 钩子安装成功 */
+static uint32_t apk_mgr_uid;               /* 已确认的管理器 uid（0=未知） */
+static int      apk_need_refine = 1;       /* 待特权域做一次精确修正 */
+static uint32_t apk_mgr_uids[4];
+static int      apk_mgr_cnt;
+static uint32_t apk_allow_uids[APK_ALLOW_MAX];   /* ctl0 allow= 逃生口 */
+static int      apk_allow_cnt;
+static volatile uint32_t apk_n_deny;       /* 被钩子判为排除的调用数 */
+static volatile uint32_t apk_n_pass;       /* 被钩子放行的调用数 */
 
-/* ========================== 学习集合 ========================== */
-static uint32_t apk_learn_ids[APK_LEARN_MAX];
-static int      apk_learn_n;
+/* 已知管理器包名（内置知识，非用户配置；可用 ctl0 mgrname= 追加） */
+static const char *apk_mgr_names[APK_MGR_NAME_MAX] = {
+    "me.yuki.folk",          /* FolkPatch 管理器 */
+    "me.bmax.apatch",        /* 原版 APatch 管理器 */
+    "com.example.apatch",
+};
 
-static uint32_t apk_allow[APK_ALLOW_MAX] = {0};
-static int      apk_allow_n = 1;
-
-static uint32_t apk_xx_learned;   /* 从受信调用者学到的 xx magic（仅参考） */
-
-static void apk_learn_add(uint32_t uid)
+static int apk_name_is_mgr(const char *pkg)
 {
     int i;
-    for (i = 0; i < apk_learn_n; i++)
-        if (apk_learn_ids[i] == uid) return;
-    if (apk_learn_n < APK_LEARN_MAX) {
-        apk_learn_ids[apk_learn_n++] = uid;
-        APK_LOG("learned uid=%u n=%d\n", (unsigned)uid, apk_learn_n);
+    for (i = 0; i < APK_MGR_NAME_MAX; i++) {
+        const char *a = apk_mgr_names[i];
+        const char *b = pkg;
+        if (!a) continue;
+        while (*a && *a == *b) { a++; b++; }
+        /* packages.list 的包名字段以空格结束；包名本身不允许 ':' 等字符，
+         * 这里只接受 字段结束符，避免前缀误匹配。 */
+        if (!*a && (!*b || *b == ' ' || *b == '\n')) return 1;
     }
-}
-
-static int apk_learn_has(uint32_t uid)
-{
-    int i;
-    for (i = 0; i < apk_learn_n; i++)
-        if (apk_learn_ids[i] == uid) return 1;
     return 0;
 }
 
-static int apk_uid_trusted(uint32_t u)
-{
-    int i;
-    if (apk_learn_has(u)) return 1;
-    for (i = 0; i < apk_allow_n; i++)
-        if (apk_allow[i] == u) return 1;
-    return 0;
-}
+/* ========================== packages.list 读取 ==========================
+ * ★调用方 SELinux 域限制（真机实测）：管理器(untrusted_app)加载模块时读该
+ * 文件被拒（ERR_PTR(-EACCES)）⇒ 只在特权域（root/system）调用。 */
+static char *apk_pkgl;
+static unsigned apk_pkgl_len;
+/* 非 0=正在修正。★刻意不用 __atomic / __sync 系列内建：arm64 上它们会生成
+ * __aarch64_swp1_acq 之类 libgcc 辅助调用，而 KPM 的导入表里没有它们
+ * ⇒ 模块会加载失败。这里是有意的"尽力而为"标志：极端竞态（两个 CPU 同时
+ * 命中 root supercall）最坏结果是多读一次文件（管理器列表本身去重）、
+ * 最多漏一个 256KB 缓冲；二选一都无害，且只在 boot 后一次性窗口内可能发生。 */
+static volatile int apk_refining;
 
-/* 鉴权门【前】的命令族：supercall.c 中全部 case 位于
- *   `if (!is_authed) return -EPERM;`
- * 之前 ⇒ 未鉴权也能返回 >=0，绝不可作学习判据（会被检测器污染学习集）。
- * 这些命令极稳定（hello/klog/ver/su），极少新增；而门【后】命令
- * （KPM 管理、skey、未来特性）是 KP 功能面，会随版本增长。
- * ★ v2.1.4 起改为**反转判据**：列出门前命令（deny 集），其余
- *   [APK_CMD_MIN, APK_CMD_MAX] 内命令一律视为门后 ⇒ 任何新门后命令
- *   自动被学习接纳，根治 item-6「命令表漂移漏学 / 误净化」。
- *   若未来 KP 新增门前命令，必须在此 deny 集补上，否则会被误当门后学坏学习集。
- *   值取自 patch/include/uapi/scdefs.h（已与真机 KP d03 对齐）。 */
-static int apk_is_pregate_cmd(uint64_t cmd)
+static int apk_load_pkglist(void)
 {
-    switch (cmd) {
-    /* ---- 第一开关（恒门前） ---- */
-    case 0x1000:  /* SUPERCALL_HELLO */
-    case 0x1004:  /* SUPERCALL_KLOG */
-    case 0x1007:  /* SUPERCALL_BUILD_TIME */
-    case 0x1008:  /* SUPERCALL_KERNELPATCH_VER */
-    case 0x1009:  /* SUPERCALL_KERNEL_VER */
-    case 0x100d:  /* SUPERCALL_AP_LOAD_PACKAGE_CONFIG */
-    /* ---- 第二开关 SU 族（门前） ---- */
-    case 0x1010:  /* SUPERCALL_SU */
-    case 0x1011:  /* SUPERCALL_SU_TASK */
-    case 0x1100:  /* SUPERCALL_SU_GRANT_UID */
-    case 0x1101:  /* SUPERCALL_SU_REVOKE_UID */
-    case 0x1102:  /* SUPERCALL_SU_NUMS */
-    case 0x1103:  /* SUPERCALL_SU_LIST */
-    case 0x1104:  /* SUPERCALL_SU_PROFILE */
-    case 0x1105:  /* SUPERCALL_SU_GET_ALLOW_SCTX */
-    case 0x1106:  /* SUPERCALL_SU_SET_ALLOW_SCTX */
-    case 0x1110:  /* SUPERCALL_SU_GET_PATH */
-    case 0x1111:  /* SUPERCALL_SU_RESET_PATH */
-    case 0x1112:  /* SUPERCALL_SU_GET_SAFEMODE */
+    void *fp;
+    loff_t pos = 0;
+    long n;
+
+    if (apk_pkgl)
         return 1;
-    default:
+    if (!apk_vmalloc || !apk_filp_open || !apk_kernel_read)
         return 0;
+    fp = apk_filp_open(APK_PKGL_PATH, 0, 0);
+    /* 内核指针转 long 是负数：不能用 <0 判错，只判 NULL 与 ERR_PTR 区间 */
+    if (!fp || (unsigned long)fp >= (unsigned long)-4095UL) {
+        APK_LOG("pkglist: open failed ptr=%llx (ctx uid=%u)\n",
+                (unsigned long long)(unsigned long)fp, (unsigned)current_uid());
+        return 0;
+    }
+    apk_pkgl = (char *)apk_vmalloc(APK_PKGL_MAX);
+    if (!apk_pkgl) { if (apk_filp_close) apk_filp_close(fp, 0); return 0; }
+    n = apk_kernel_read(fp, apk_pkgl, APK_PKGL_MAX - 1, &pos);
+    if (apk_filp_close) apk_filp_close(fp, 0);
+    if (n <= 0) {
+        /* ★读失败必须回收，否则 256KB 缓冲泄漏且下次调用会误判"已加载" */
+        APK_LOG("pkglist: read rc=%ld\n", n);
+        if (apk_vfree) apk_vfree(apk_pkgl);
+        apk_pkgl = 0;
+        return 0;
+    }
+    apk_pkgl_len = (unsigned)n;
+    apk_pkgl[apk_pkgl_len] = 0;
+    APK_LOG("pkglist: read n=%u bytes\n", apk_pkgl_len);
+    return 1;
+}
+
+/* 逐行处理：行格式 "<pkg> <uid> ..." */
+static void apk_each_pkg(void (*cb)(const char *pkg, uint32_t uid, void *ud), void *ud)
+{
+    unsigned i = 0;
+    if (!apk_pkgl) return;
+    while (i < apk_pkgl_len) {
+        unsigned e = i, j;
+        uint32_t uid = 0;
+        while (e < apk_pkgl_len && apk_pkgl[e] != '\n') e++;
+        if (e > i + 2) {
+            j = i;
+            while (j < e && apk_pkgl[j] != ' ') j++;
+            if (j < e) {
+                unsigned k = j + 1;
+                while (k < e && apk_pkgl[k] >= '0' && apk_pkgl[k] <= '9')
+                    uid = uid * 10u + (uint32_t)(apk_pkgl[k++] - '0');
+                if (uid) {
+                    char pkg[64];
+                    unsigned n = (j - i) < 63 ? (j - i) : 63;
+                    for (k = 0; k < n; k++) pkg[k] = apk_pkgl[i + k];
+                    pkg[n] = 0;
+                    cb(pkg, uid, ud);
+                }
+            }
+        }
+        i = e + 1;
     }
 }
 
-/* 门后命令判据（反转）：在 supercall 命令区间内、且不在门前 deny 集 ⇒ 门后。
- * 门后命令 ret>=0 即真实通过 KP 鉴权（superkey/trusted_manager），
- * 检测器无 key 永远做不到 ⇒ 判据不可伪造。 */
-static int apk_is_postgate_cmd(uint64_t cmd)
+/* ========================== 排除操作（降级模式用） ========================== */
+static volatile uint32_t apk_n_excl, apk_n_unexcl, apk_n_skip;
+
+static void apk_excl(uint32_t uid, int exclude)
 {
-    if (cmd < APK_CMD_MIN || cmd > APK_CMD_MAX)
-        return 0;
-    return !apk_is_pregate_cmd(cmd);
+    if (uid == 0) return;
+    if (exclude) {
+        if (get_ap_mod_exclude(uid)) { apk_n_skip++; return; }
+        set_ap_mod_exclude(uid, 1);
+        apk_n_excl++;
+    } else {
+        if (!get_ap_mod_exclude(uid)) return;
+        set_ap_mod_exclude(uid, 0);
+        apk_n_unexcl++;
+    }
 }
 
-/* ========================== 运行时解析符号 ============ */
-static long (*apk_nofault_r)(void *dst, const void *src, size_t n);
-static int  (*apk_snprintf)(char *buf, size_t sz, const char *fmt, ...);
-static long (*apk_copy_to_user)(void *to, const void *from, unsigned long n);
+static void apk_sweep_span(uint32_t from, uint32_t to, int exclude)
+{
+    uint32_t u;
+    for (u = from; u < to; u++) {
+        if (exclude && u == apk_loader_uid)
+            continue;                       /* 加载者默认放行（见 apk_trusted_uid） */
+        apk_excl(u, exclude);
+    }
+}
 
-/* ★ hook / unhook / compat_strncpy_from_user 是 **KP 导出表**符号
- *   （KP_EXPORT_SYMBOL），内核 /proc/kallsyms 里没有 —— kallsyms_lookup_name
- *   ("hook") 实测返回 NULL（v2.1.0/2.1.1 g2 因此全程 off）。正确用法 = 直接
- *   extern 声明，由 KPM 加载器从 KP 符号表解析（LH_Dr_KPM 的 nm -u 权威集
- *   含 hook/unhook，已在原版 APatch 真机加载成功）。声明来自 <hook.h> /
- *   <kputils.h>，此处不重复定义。 */
+/* ★仅降级模式（钩子装不上）调用：区间枚举无法覆盖全部 uid 段，属于"有洞的
+ * 兜底"，正常路径（钩子成功）完全不写 kstorage。 */
+static void apk_sweep_range(int exclude)
+{
+    apk_sweep_span(APK_AID_EXCL_START, APK_AID_EXCL_END, exclude);
+    apk_sweep_span(APK_AID_ISO_START, APK_AID_ISO_END, exclude);
+    apk_swept = exclude;
+    APK_LOG("sweep(deg) [%u,%u)+[%u,%u) exclude=%d -> excl=%u skip=%u\n",
+            APK_AID_EXCL_START, APK_AID_EXCL_END, APK_AID_ISO_START,
+            APK_AID_ISO_END, exclude, (unsigned)apk_n_excl, (unsigned)apk_n_skip);
+}
 
-/* 原生 nr45（truncate）入口：净化时还原 origin 语义 */
-static uintptr_t apk_orig45;
+/* ② 精确修正：按 packages.list 的 包名↔uid 映射确定管理器 */
+static void apk_refine_cb(const char *pkg, uint32_t uid, void *ud)
+{
+    int is_mgr = apk_name_is_mgr(pkg);
+    (void)ud;
+    if (is_mgr) {
+        int i, dup = 0;
+        for (i = 0; i < apk_mgr_cnt; i++)
+            if (apk_mgr_uids[i] == uid) dup = 1;
+        if (!dup && apk_mgr_cnt < 4) {
+            apk_mgr_uids[apk_mgr_cnt++] = uid;
+            if (!apk_mgr_uid) apk_mgr_uid = uid;
+            APK_LOG("mgr confirmed uid=%u pkg=%s\n", (unsigned)uid, pkg);
+        }
+        /* 钩子模式下无需写 kstorage（判定在钩子里当场做）；
+         * 降级模式必须解除管理器的排除，否则管理器会被自己扫出去。 */
+        if (!apk_hook_ok)
+            apk_excl(uid, 0);
+        return;
+    }
+    /* 降级模式：非管理器应用补排除（含"不是管理器的加载者"） */
+    if (!apk_hook_ok)
+        apk_excl(uid, 1);
+}
 
-/* ========================== 计数（status） ========================== */
-static volatile uint32_t apk_n_pass;    /* 受信放行 */
-static volatile uint32_t apk_n_learn;   /* 学习成功 */
-static volatile uint32_t apk_n_purify;  /* 净化（改写 ret） */
-static volatile uint32_t apk_n_native;  /* KP 未认领，原生执行 */
-static volatile uint32_t apk_n_absent;  /* 页研判：确信缺失 */
-static volatile uint32_t apk_n_g2;      /* G2 拦截次数 */
-static volatile uint32_t apk_n_g2o;     /* G2 放行次数（present/受信） */
-static volatile uint32_t apk_n_g2fc;    /* G2 fail-closed 硬堵次数（标定失败也堵） */
+/* 特权域（root）里跑的一次修正；失败保留 need_refine（下次再试，最多 N 次） */
+static void apk_refine(const char *why)
+{
+    static int tries;
 
-/* 钩子状态 */
-static int apk_hooked;
-static int apk_g2_installed;            /* G2 inline hook 已装 */
-static volatile int apk_g2_inflight;    /* 在途 stub 计数（卸载排空） */
+    if (!apk_need_refine)
+        return;
+    if (tries >= APK_REFINE_MAX_TRY)
+        return;
+    /* 防重入：两个 CPU 同时命中 root supercall 时只让一个读文件 */
+    if (apk_refining)
+        return;
+    apk_refining = 1;
+    tries++;
+
+    (void)why;                              /* release 版无日志，仅调试打印用 */
+    if (!apk_load_pkglist()) {
+        APK_LOG("refine(%s#%d): no packages.list -> 加载者保持临时信任\n",
+                why, tries);
+        apk_refining = 0;
+        return;
+    }
+    APK_LOG("refine(%s#%d): scanning packages.list\n", why, tries);
+    apk_each_pkg(apk_refine_cb, 0);
+    apk_need_refine = 0;
+    APK_LOG("refine done: mgr=%u cnt=%d loader=%u hook=%d\n",
+            (unsigned)apk_mgr_uid, apk_mgr_cnt, (unsigned)apk_loader_uid,
+            apk_hook_ok);
+    apk_refining = 0;
+}
+
+static uint32_t apk_atou(const char *s)
+{
+    uint32_t v = 0;
+    while (*s >= '0' && *s <= '9') v = v * 10u + (uint32_t)(*s++ - '0');
+    return v;
+}
 
 /* ==========================================================================
- * 一、用户页表研判（移植自 v1.0.0，真机调通；运行时解析、不碰用户内存）
+ * ★v3.2 核心：钩子主体（对任何 uid 当场裁决）
+ *   受信 = uid 0 ∪ 显式放行(allow=) ∪ 加载者(修正前) ∪ 名字校验过的管理器
+ *   其余一律 1（= 已排除）⇒ KP before() 立即 return：不读 key、不鉴权、
+ *   不分发、无副作用。
+ *   代价：本函数在 KP 的 NR45 钩子链里（原本 KP 自己也要在那里做一次
+ *   kstorage 哈希查询），增量是十几个比较指令；未受信 uid 反而比"KP 查
+ *   kstorage"更快返回，不会留下"更慢"的时序指纹。
  * ========================================================================== */
-static int      apk_walk_ok;     /* 线性映射偏移已内容验证 */
-static int      apk_walk_ver;    /* 已被 oracle 武装（G2 硬前提） */
-static int      apk_st_done;     /* oracle 已尝试 */
-static uint64_t apk_lin_off;
-static uint64_t apk_upgd;        /* 当前进程用户 PGD 的线性别名 VA */
-static uint64_t apk_mair;        /* 必须 64 位：AttrIndx4..7 在 bits[39:32] */
-static int      apk_ubits;       /* 用户 VA 位宽 39/48 */
-static int      apk_ups;         /* 用户页大小 log2 */
-static int      apk_ulevel;      /* 用户页表级数 */
+static int (*apk_orig_get_excl)(uid_t uid);
 
-static inline uint64_t apk_phys_mask(int shift)
+static int apk_trusted_uid(uint32_t u)
 {
-    return (~((1ULL << shift) - 1)) & APK_PHYS_MASK_MAX;
+    int i;
+    if (u == 0)                                     /* root：恢复通道 */
+        return 1;
+    for (i = 0; i < apk_allow_cnt; i++)
+        if (apk_allow_uids[i] == u) return 1;        /* ctl0 allow= 逃生口 */
+    for (i = 0; i < apk_mgr_cnt; i++)
+        if (apk_mgr_uids[i] == u) return 1;          /* 名字校验过的管理器 */
+    /* 加载者：仅在特权域修正完成前临时放行。
+     * 修正后仍受信 ⇔ 它确实是被 packages.list 证实的管理器（在前一循环里）；
+     * 否则（例如某个 app 抢先用公开钥匙加载）在此被重新拒绝。 */
+    if (apk_loader_uid && u == apk_loader_uid && apk_need_refine)
+        return 1;
+    return 0;
 }
 
+static int apk_get_excl_hook(uid_t uid)
+{
+    uint32_t u = (uint32_t)uid;
 
+    /* 第一次见到 root 的 supercall ⇒ 在 root 域里做一次精确修正
+     * （只有特权域读得了 /data/system/packages.list） */
+    if (u == 0 && apk_need_refine)
+        apk_refine("hook-uid0");
+
+    if (apk_trusted_uid(u)) {
+        apk_n_pass++;
+        return 0;                       /* 放行：KP 继续原有鉴权流程 */
+    }
+    apk_n_deny++;
+    if (apk_n_deny <= 8)
+        APK_LOG("hook-deny uid=%u\n", (unsigned)u);
+    return 1;                           /* 视为已排除：KP 立即返回，零副作用 */
+}
+
+/* ========================== ctl0（按信任集准入） ========================== */
+static int apk_str_prefix(const char *s, const char *p)
+{
+    while (*p) { if (*s++ != *p++) return 0; }
+    return 1;
+}
+
+static void apk_status_line(char *buf, int buflen)
+{
+    if (!buf || buflen <= 0) return;
+    buf[0] = 0;
+    if (!apk_snprintf) return;
+    apk_snprintf(buf, (size_t)buflen,
+                 "APKey_Hide v3.2.0 hook=%d swept=%d loader=%u mgr=%u "
+                 "need_refine=%d allow=%d deny=%u pass=%u "
+                 "n(excl=%u unexcl=%u skip=%u) names=%s,%s,%s",
+                 apk_hook_ok, apk_swept, (unsigned)apk_loader_uid,
+                 (unsigned)apk_mgr_uid, apk_need_refine, apk_allow_cnt,
+                 (unsigned)apk_n_deny, (unsigned)apk_n_pass,
+                 (unsigned)apk_n_excl, (unsigned)apk_n_unexcl,
+                 (unsigned)apk_n_skip,
+                 apk_mgr_names[0] ? apk_mgr_names[0] : "-",
+                 apk_mgr_names[1] ? apk_mgr_names[1] : "-",
+                 apk_mgr_names[2] ? apk_mgr_names[2] : "-");
+    buf[buflen - 1] = 0;
+}
+
+/* mgrname= 的实参来自 ctl0 的栈缓冲，必须拷进静态存储（旧版直接存指针 ⇒
+ * ctl0 返回后即悬垂引用）。 */
+static char apk_mgr_name_storage[4][64];
+
+long apk_ctl0(const char *args, char *__user out_msg, int outlen)
+{
+    char cmd[64];
+    char out[448];
+    int n = 0;
+    uint32_t uid = (uint32_t)current_uid();
+
+    /* 准入 = 信任集（root ∪ 加载者 ∪ 管理器 ∪ allow=）。
+     * 其余 uid 其实到不了这里（KP 门后命令 + 钩子已把它们判为排除），
+     * 这里再兜一道；★旧版写成 uid!=0 会让管理器无法执行 status/sweep。 */
+    if (!apk_trusted_uid(uid))
+        return -EPERM;
+
+    if (args) {
+        while (args[n] && n < (int)sizeof(cmd) - 1) { cmd[n] = args[n]; n++; }
+    }
+    cmd[n] = 0;
+
+    if (n > 0) {
+        if (apk_str_prefix(cmd, "sweep")) {
+            apk_need_refine = 1;            /* 允许重新修正（例如新装了管理器） */
+            apk_refine("ctl0");
+        } else if (apk_str_prefix(cmd, "allow=")) {
+            uint32_t a = apk_atou(cmd + 6);
+            int i, dup = 0;
+            for (i = 0; i < apk_allow_cnt; i++)
+                if (apk_allow_uids[i] == a) dup = 1;
+            if (a && !dup && apk_allow_cnt < APK_ALLOW_MAX)
+                apk_allow_uids[apk_allow_cnt++] = a;
+            apk_excl(a, 0);                 /* 降级模式同样生效 */
+        } else if (apk_str_prefix(cmd, "deny=")) {
+            apk_excl((uint32_t)apk_atou(cmd + 5), 1);
+        } else if (apk_str_prefix(cmd, "mgrname=")) {
+            int i;
+            const char *src = cmd + 8;
+            /* 轮转：新名字进 [0]，其余后移 */
+            for (i = 3; i > 0; i--) {
+                int k;
+                for (k = 0; k < 63; k++) {
+                    apk_mgr_name_storage[i][k] = apk_mgr_name_storage[i - 1][k];
+                    if (!apk_mgr_name_storage[i - 1][k]) break;
+                }
+                apk_mgr_name_storage[i][63] = 0;
+                apk_mgr_names[i] = apk_mgr_name_storage[i];
+            }
+            if (src[0]) {
+                int k;
+                for (k = 0; k < 63 && src[k]; k++)
+                    apk_mgr_name_storage[0][k] = src[k];
+                apk_mgr_name_storage[0][k] = 0;
+                apk_mgr_names[0] = apk_mgr_name_storage[0];
+            }
+            apk_need_refine = 1;
+            apk_refine("mgrname");
+        }
+    }
+
+    apk_status_line(out, (int)sizeof(out));
+    if (out_msg && outlen > 0 && apk_copy_to_user) {
+        int len = 0;
+        while (out[len] && len < outlen - 1) len++;
+        if (len > 0)
+            (void)apk_copy_to_user(out_msg, out, (unsigned long)(len + 1));
+    }
+    return 0;
+}
+
+KPM_CTL0(apk_ctl0);
+
+/* ========================== 安装 / 卸载 ========================== */
+static long apk_init(const char *args, const char *event, void *reserved)
+{
+    int err = -1;
+    (void)args; (void)event; (void)reserved;
+
+    apk_printk = (int (*)(const char *, ...))kallsyms_lookup_name("printk");
+    if (!apk_printk)
+        apk_printk = (int (*)(const char *, ...))kallsyms_lookup_name("_printk");
+    apk_snprintf = (int (*)(char *, size_t, const char *, ...))
+        kallsyms_lookup_name("scnprintf");
+    if (!apk_snprintf)
+        apk_snprintf = (int (*)(char *, size_t, const char *, ...))
+            kallsyms_lookup_name("snprintf");
+    apk_copy_to_user = (long (*)(void *, const void *, unsigned long))
+        kallsyms_lookup_name("copy_to_user");
+    if (!apk_copy_to_user)
+        apk_copy_to_user = (long (*)(void *, const void *, unsigned long))
+            kallsyms_lookup_name("_copy_to_user");
+    apk_vmalloc = (void *(*)(unsigned long))kallsyms_lookup_name("vmalloc");
+    apk_vfree = (void (*)(const void *))kallsyms_lookup_name("vfree");
+    apk_filp_open = (void *(*)(const char *, int, int))kallsyms_lookup_name("filp_open");
+    apk_kernel_read = (long (*)(void *, void *, unsigned long, loff_t *))
+        kallsyms_lookup_name("kernel_read");
+    apk_filp_close = (int (*)(void *, void *))kallsyms_lookup_name("filp_close");
+
+    /* 加载者：修正完成前临时受信（管理器手动加载 ⇒ 立即可用，无手工步骤） */
+    apk_loader_uid = (uint32_t)current_uid();
+
+    /* ① 钩住 KP 的 get_ap_mod_exclude：按调用者当场判定，覆盖任何 uid
+     *    （含 Android isolatedProcess 的 9xxxx、多用户 10xxxx、以及未来任何
+     *    新 uid 段）。真机实测：纯区间枚举漏掉 uid>=20000，普通 app 用
+     *    isolatedProcess 就能换到新 uid 读走真实 superkey。 */
+    err = hook((void *)get_ap_mod_exclude, (void *)apk_get_excl_hook,
+               (void **)&apk_orig_get_excl);
+    if (err || !apk_orig_get_excl) {
+        APK_LOG("init: hook FAILED err=%d (ptr=%llx) -> 降级区间排除\n",
+                err, (unsigned long long)(unsigned long)apk_orig_get_excl);
+        apk_orig_get_excl = 0;
+        apk_hook_ok = 0;
+        apk_sweep_range(1);
+    } else {
+        apk_hook_ok = 1;
+        APK_LOG("init: hooked get_ap_mod_exclude ok (orig=%llx)\n",
+                (unsigned long long)(unsigned long)apk_orig_get_excl);
+    }
+
+    /* ② 加载者若在特权域（root/init/CLI），立刻做一次精确修正：此时读得了
+     *    packages.list，管理器身份当场确定、多用户区间一并处理，且"不是管理器
+     *    的加载者"会被立刻收回临时信任。若加载者是管理器（untrusted_app 域），
+     *    文件读会被 SELinux 拒 ⇒ 保持临时信任 + 区间兜底，等 root 域的一次
+     *    supercall（任何 root 下的 KP 命令都会触发）自动完成修正。 */
+    if (apk_loader_uid < APK_AID_APP_START)
+        apk_refine("init-privileged");
+
+    APK_LOG("init v3.2.0 done loader=%u hook=%d swept=%d mgr=%u need_refine=%d\n",
+            (unsigned)apk_loader_uid, apk_hook_ok, apk_swept,
+            (unsigned)apk_mgr_uid, apk_need_refine);
+    return 0;
+}
+
+static long apk_exit(void *reserved)
+{
+    (void)reserved;
+    /* 顺序重要：① 先摘钩子（否则下面 unexclude 会被自己的钩子拦住判定）
+     *           ② 再恢复 kstorage（降级模式才写过） */
+    if (apk_hook_ok) {
+        unhook((void *)get_ap_mod_exclude);
+        apk_hook_ok = 0;
+        apk_orig_get_excl = 0;
+    }
+    if (apk_swept)
+        apk_sweep_range(0);
+    if (apk_mgr_uid)
+        apk_excl(apk_mgr_uid, 0);
+    if (apk_pkgl) {
+        if (apk_vfree) apk_vfree(apk_pkgl);
+        apk_pkgl = 0;
+    }
+    APK_LOG("exit done\n");
+    return 0;
+}
+
+KPM_INIT(apk_init);
+KPM_EXIT(apk_exit);
 /*
                ............................ ............. :................................         
              ............................ :. ............ -.................................        
@@ -329,863 +618,7 @@ static inline uint64_t apk_phys_mask(int shift)
           ....... -@@@@@.          .@@@@@@@@@@@@@@@@@@@@@@@@@@*           %@@@@@@@@- ........       
 
           我也要被检测吗
+          我已经力竭了，LONGZE你赢了挺厉害的，这个只能算勉强解决吧
+          都给我去换成KSU或者其他原版AP或者其他分支不要设置密钥
+          这破鉴权设计架构我真服了
 */
-
-/* 解析 va 叶子描述符；0 = present（用户映射、非 Device） */
-static int apk_walk(uint64_t pgd_va, uint64_t va, int ps, int level, int require_user,
-                    uint64_t lin_off, uint64_t *out_pa, uint64_t *out_leaf_va,
-                    uint64_t *out_leaf, int *out_blk)
-{
-    uint64_t base = pgd_va;
-    uint64_t ent = 0;
-    int lv, idx, shift;
-
-    if (!apk_nofault_r || !pgd_va)
-        return -3;
-    if (level < 2 || level > 4)
-        return -3;
-
-    for (lv = level; lv > 1; lv--) {
-        shift = ps + 9 * (lv - 1);
-        idx = (int)((va >> shift) & 0x1FF);
-
-        if (apk_nofault_r(&ent, (void *)(base + (uint64_t)idx * 8), 8) != 0)
-            return -1;
-        if (!(ent & 0x1))
-            return -1;
-
-        if ((ent & 0x3) == 0x1) {            /* 块映射（大页）即叶子 */
-            *out_pa = (ent & apk_phys_mask(shift)) | (va & ((1ULL << shift) - 1));
-            *out_leaf_va = base + (uint64_t)idx * 8;
-            *out_leaf = ent;
-            *out_blk = shift;
-            goto leaf_check;
-        }
-
-        {                                    /* 表映射：下钻 */
-            uint64_t next_pa = ent & apk_phys_mask(ps);
-            if (next_pa == 0 || next_pa >= APK_PHYS_MAX)
-                return -1;
-            base = next_pa + lin_off;
-        }
-    }
-
-    idx = (int)((va >> ps) & 0x1FF);         /* PTE 级 */
-    if (apk_nofault_r(&ent, (void *)(base + (uint64_t)idx * 8), 8) != 0)
-        return -1;
-    if ((ent & 0x3) != 0x3)
-        return -1;
-    *out_pa = (ent & apk_phys_mask(ps)) | (va & ((1ULL << ps) - 1));
-    *out_leaf_va = base + (uint64_t)idx * 8;
-    *out_leaf = ent;
-    *out_blk = ps;
-
-leaf_check:
-    if (require_user && !(ent & APK_PTE_USER))
-        return -1;
-    if (apk_mair) {
-        uint8_t attr = (uint8_t)((apk_mair >> (((ent >> 2) & 7) * 8)) & 0xFF);
-        if ((attr & 0xF0) == 0)
-            return -2;                       /* Device：拒绝线性映射读 */
-    }
-    return 0;
-}
-
-/* TTBR0 每进程不同 ⇒ 每次判定前刷新（一条 mrs + 加法）。保留 BADDR 全部
- * 有效位，只清 ASID([63:48]) 与 4KB 以下低位（CnP/保留位） */
-static void apk_refresh_upgd(void)
-{
-    uint64_t t = apk_mrs_ttbr0() & ((1ULL << 48) - 1) & ~0xFFFULL;
-    apk_upgd = t ? (t + apk_lin_off) : 0;
-}
-
-/* va 所在用户页是否已换入（present 且用户映射） */
-static int apk_page_present(uint64_t va)
-{
-    uint64_t pa = 0, leaf_va = 0, leaf = 0;
-    int blk = 0;
-
-    if (!apk_upgd || !va)
-        return 0;
-    return apk_walk(apk_upgd, va, apk_ups, apk_ulevel, 1, apk_lin_off,
-                    &pa, &leaf_va, &leaf, &blk) == 0;
-}
-
-/* 确信"页不可用"（无有效用户 PTE）—— G2 唯一放行拦截的判据；
- * 任何不确定（未标定/未武装/TTBR0 不可用）一律返回 0（fail-open）。 */
-static int apk_user_page_absent(uint64_t va)
-{
-    if (!apk_walk_ok || !apk_walk_ver)
-        return 0;
-    if (va < 0x1000)
-        return 1;
-    if (va >= (1ULL << apk_ubits))
-        return 1;                            /* 内核地址/非法 */
-    apk_refresh_upgd();
-    if (!apk_upgd)
-        return 0;
-    if (apk_page_present(va))
-        return 0;
-    apk_n_absent++;
-    return 1;
-}
-
-/* 线性映射偏移候选：PAGE_OFFSET 历史公式 × 是否减 memstart，全部靠内容比对择优 */
-static int apk_po_candidates(uint64_t *out, int max)
-{
-    uint64_t memstart = 0;
-    uint64_t ms = (uint64_t)(uintptr_t)kallsyms_lookup_name("memstart_addr");
-    int vb_k = 64 - (int)((apk_mrs_tcr() >> 16) & 0x3F);   /* 内核 VA_BITS */
-    int vb_alt = (vb_k == 39) ? 48 : 39;
-    int n = 0, k, i;
-
-    if (ms)
-        (void)apk_nofault_r(&memstart, (void *)ms, 8);
-
-    for (k = 0; k < 4; k++) {
-        int vb = (k & 1) ? vb_alt : vb_k;
-        uint64_t po;
-        int dup;
-
-        if (vb < 32 || vb > 52)
-            continue;
-        po = (k < 2) ? ~((1ULL << (vb - 1)) - 1) : ~((1ULL << vb) - 1) + 1;
-        dup = 0;
-        for (i = 0; i < n; i++)
-            if (out[i] == po) dup = 1;
-        if (!dup && n < max)
-            out[n++] = po;
-        if (memstart) {
-            dup = 0;
-            for (i = 0; i < n; i++)
-                if (out[i] == po - memstart) dup = 1;
-            if (!dup && n < max)
-                out[n++] = po - memstart;
-        }
-    }
-    return n;
-}
-
-/* 从 TCR_EL1 推导用户侧位宽/页大小/级数（确定性） */
-static void apk_user_params_from_tcr(void)
-{
-    uint64_t tcr = apk_mrs_tcr();
-    int tg0 = (int)((tcr >> 14) & 0x3);
-
-    apk_ubits = 64 - (int)(tcr & 0x3F);
-    if (apk_ubits != 39 && apk_ubits != 48)
-        apk_ubits = 48;
-    apk_ups = (tg0 == 1) ? 16 : ((tg0 == 2) ? 14 : 12);
-    apk_ulevel = (apk_ubits - 4) / (apk_ups - 3);
-    if (apk_ulevel < 2 || apk_ulevel > 4) {
-        apk_ubits = 39;
-        apk_ups = 12;
-        apk_ulevel = 3;
-    }
-}
-
-/* ---- 标定路径 A：kimage_voffset 直接拿 (_text VA, PA) 对，内容比对锁定线性
- * 偏移。全程只读内核内存，零副作用，不依赖页表遍历。 ---- */
-static int apk_calib_kimage(void)
-{
-    unsigned char ref[APK_ID_BYTES];
-    uint64_t kimg_sym = (uint64_t)(uintptr_t)kallsyms_lookup_name("kimage_voffset");
-    uint64_t text_va = (uint64_t)(uintptr_t)kallsyms_lookup_name("_text");
-    uint64_t kv = 0, text_pa;
-    uint64_t cands[16];
-    int n, i, k, ok;
-
-    if (!text_va)
-        text_va = (uint64_t)(uintptr_t)kallsyms_lookup_name("_stext");
-    if (!kimg_sym || !text_va)
-        return 0;
-    if (apk_nofault_r(&kv, (void *)kimg_sym, 8) != 0 || !kv)
-        return 0;
-    text_pa = text_va - kv;
-    if (text_pa < 0x1000 || text_pa >= APK_PHYS_MAX)
-        return 0;
-
-    for (i = 0; i < APK_ID_BYTES; i++)
-        if (apk_nofault_r(&ref[i], (void *)(text_va + (uint64_t)i), 1) != 0)
-            return 0;
-
-    n = apk_po_candidates(cands, 16);
-    for (i = 0; i < n; i++) {
-        ok = 1;
-        for (k = 0; k < APK_ID_BYTES; k++) {
-            unsigned char b = 0;
-            if (apk_nofault_r(&b, (void *)(text_pa + cands[i] + (uint64_t)k), 1) != 0
-                || b != ref[k]) {
-                ok = 0;
-                break;
-            }
-        }
-        if (ok) {
-            apk_lin_off = cands[i];
-            APK_LOG("calib A OK lin=%llx\n", (unsigned long long)cands[i]);
-            return 1;
-        }
-    }
-    return 0;
-}
-
-/* ---- 标定路径 B（兜底）：TTBR1 页表遍历 + swapper_pg_dir 可读性筛选 +
- * _stext 内容比对。MAIR 必须先取（否则叶子全被误判 Device）。 ---- */
-static int apk_verify_offset(uint64_t d, uint64_t kpgd, uint64_t stext_va,
-                             int kbits, int kps)
-{
-    uint64_t pa = 0, leaf_va = 0, leaf = 0;
-    uint64_t page_mask = (1ULL << kps) - 1;
-    int level = (kbits - 4) / (kps - 3);
-    int blk = 0, i;
-
-    if (!kpgd || level < 2 || level > 4)
-        return 0;
-    if (apk_walk(kpgd, stext_va, kps, level, 0, d, &pa, &leaf_va, &leaf, &blk) != 0)
-        return 0;
-    if (pa == 0 || (pa & page_mask) != (stext_va & page_mask))
-        return 0;
-
-    for (i = 0; i < APK_ID_BYTES; i++) {
-        unsigned char x = 0, y = 0;
-        if (apk_nofault_r(&x, (void *)(stext_va + (uint64_t)i), 1) != 0)
-            return 0;
-        if (apk_nofault_r(&y, (void *)((pa & ~page_mask) + d + (uint64_t)i), 1) != 0)
-            return 0;
-        if (x != y)
-            return 0;
-    }
-    return 1;
-}
-
-
-
-
-
-
-
-
-
-
-/***
- *               ii.                                         ;9ABH,          
- *              SA391,                                    .r9GG35&G          
- *              &#ii13Gh;                               i3X31i;:,rB1         
- *              iMs,:,i5895,                         .5G91:,:;:s1:8A         
- *               33::::,,;5G5,                     ,58Si,,:::,sHX;iH1        
- *                Sr.,:;rs13BBX35hh11511h5Shhh5S3GAXS:.,,::,,1AG3i,GG        
- *                .G51S511sr;;iiiishS8G89Shsrrsh59S;.,,,,,..5A85Si,h8        
- *               :SB9s:,............................,,,.,,,SASh53h,1G.       
- *            .r18S;..,,,,,,,,,,,,,,,,,,,,,,,,,,,,,....,,.1H315199,rX,       
- *          ;S89s,..,,,,,,,,,,,,,,,,,,,,,,,....,,.......,,,;r1ShS8,;Xi       
- *        i55s:.........,,,,,,,,,,,,,,,,.,,,......,.....,,....r9&5.:X1       
- *       59;.....,.     .,,,,,,,,,,,...        .............,..:1;.:&s       
- *      s8,..;53S5S3s.   .,,,,,,,.,..      i15S5h1:.........,,,..,,:99       
- *      93.:39s:rSGB@A;  ..,,,,.....    .SG3hhh9G&BGi..,,,,,,,,,,,,.,83      
- *      G5.G8  9#@@@@@X. .,,,,,,.....  iA9,.S&B###@@Mr...,,,,,,,,..,.;Xh     
- *      Gs.X8 S@@@@@@@B;..,,,,,,,,,,. rA1 ,A@@@@@@@@@H;........,,,,,,.iX:    
- *     ;9. ,8A#@@@@@@#5,.,,,,,,,,,... 9A. 8@@@@@@@@@@M;    ....,,,,,,,,S8    
- *     X3    iS8XAHH8s.,,,,,,,,,,...,..58hH@@@@@@@@@Hs       ...,,,,,,,:Gs   
- *    r8,        ,,,...,,,,,,,,,,.....  ,h8XABMMHX3r.          .,,,,,,,.rX:  
- *   :9, .    .:,..,:;;;::,.,,,,,..          .,,.               ..,,,,,,.59  
- *  .Si      ,:.i8HBMMMMMB&5,....                    .            .,,,,,.sMr
- *  SS       :: h@@@@@@@@@@#; .                     ...  .         ..,,,,iM5
- *  91  .    ;:.,1&@@@@@@MXs.                            .          .,,:,:&S
- *  hS ....  .:;,,,i3MMS1;..,..... .  .     ...                     ..,:,.99
- *  ,8; ..... .,:,..,8Ms:;,,,...                                     .,::.83
- *   s&: ....  .sS553B@@HX3s;,.    .,;13h.                            .:::&1
- *    SXr  .  ...;s3G99XA&X88Shss11155hi.                             ,;:h&,
- *     iH8:  . ..   ,;iiii;,::,,,,,.                                 .;irHA  
- *      ,8X5;   .     .......                                       ,;iihS8Gi
- *         1831,                                                 .,;irrrrrs&@
- *           ;5A8r.                                            .:;iiiiirrss1H
- *             :X@H3s.......                                .,:;iii;iiiiirsrh
- *              r#h:;,...,,.. .,,:;;;;;:::,...              .:;;;;;;iiiirrss1
- *             ,M8 ..,....,.....,,::::::,,...         .     .,;;;iiiiiirss11h
- *             8B;.,,,,,,,.,.....          .           ..   .:;;;;iirrsss111h
- *            i@5,:::,,,,,,,,.... .                   . .:::;;;;;irrrss111111
- *            9Bi,:,,,,......                        ..r91;;;;;iirrsss1ss1111
- * 
- * 
- * 
- * 
- */
- 
-
-
-
-
-
-
-
-
-
-
-
-static int apk_calib_kernel(void)
-{
-    uint64_t tcr = apk_mrs_tcr();
-    uint64_t stext_va;
-    uint64_t baddr1;
-    uint64_t cands[16];
-    int n, i, x, y, done = 0;
-
-    if (!apk_nofault_r)
-        return 0;
-
-    stext_va = (uint64_t)(uintptr_t)kallsyms_lookup_name("_stext");
-    baddr1 = apk_mrs_ttbr1() & ((1ULL << 48) - 1) & ~0xFFFULL;
-    if (!stext_va || !baddr1)
-        return 0;
-
-    n = apk_po_candidates(cands, 16);
-    if (!n)
-        return 0;
-
-    {   /* 先筛掉线性别名不可读的候选（偏移错 ⇒ 指向未映射 VA） */
-        int nn = 0;
-        uint64_t keep[16];
-        for (i = 0; i < n; i++) {
-            uint64_t ent0 = 0;
-            if (apk_nofault_r(&ent0, (void *)(baddr1 + cands[i]), 8) == 0)
-                keep[nn++] = cands[i];
-        }
-        if (nn) {
-            for (i = 0; i < nn; i++)
-                cands[i] = keep[i];
-            n = nn;
-        }
-    }
-
-    {
-        int tg1 = (int)((tcr >> 30) & 0x3);
-        /* TG1 编码与 TG0 不同：0b01=16KB, 0b10=4KB, 0b11=64KB */
-        int tg1_ps = (tg1 == 1) ? 14 : ((tg1 == 2) ? 12 : 16);
-        int bits_tcr = 64 - (int)((tcr >> 16) & 0x3F);
-        static const int bits_c[2] = {39, 48};
-        static const int ps_c[3] = {12, 16, 14};
-        int bits_try[3], ps_try[4], nb = 0, np = 0;
-
-        bits_try[nb++] = (bits_tcr == 39 || bits_tcr == 48) ? bits_tcr : 39;
-        for (x = 0; x < 2; x++)
-            if (bits_c[x] != bits_try[0])
-                bits_try[nb++] = bits_c[x];
-        ps_try[np++] = tg1_ps;
-        for (y = 0; y < 3; y++)
-            if (ps_c[y] != tg1_ps)
-                ps_try[np++] = ps_c[y];
-
-        for (i = 0; i < n && !done; i++) {
-            for (x = 0; x < nb && !done; x++) {
-                for (y = 0; y < np && !done; y++) {
-                    if (!apk_verify_offset(cands[i], baddr1 + cands[i], stext_va,
-                                           bits_try[x], ps_try[y]))
-                        continue;
-                    apk_lin_off = cands[i];
-                    done = 1;
-                }
-            }
-        }
-    }
-    if (done)
-        APK_LOG("calib B OK lin=%llx\n", (unsigned long long)apk_lin_off);
-    return done;
-}
-
-/* oracle：调用者 PC 所在页必然 present（马上要从它返回执行）。
- * 遍历若说"不可用" ⇒ 标定/参数错了 ⇒ 永久 fail-open。 */
-static void apk_walk_sanity(uint64_t pc)
-{
-    apk_refresh_upgd();
-    if (!apk_upgd) {
-        apk_walk_ok = 0;
-        APK_LOG("oracle upgd=0 -> walk off\n");
-        return;
-    }
-    if (!apk_page_present(pc & ~0xFFFULL)) {
-        apk_walk_ok = 0;
-        APK_LOG("oracle pc=%llx NOT present -> walk off\n",
-                (unsigned long long)pc);
-        return;
-    }
-    apk_walk_ver = 1;
-    APK_LOG("oracle pc=%llx present -> walk armed\n", (unsigned long long)pc);
-}
-
-/* ==========================================================================
- * 二、G2 守卫：compat_strncpy_from_user 内联钩子（页侧信道拦截点）
- *
- *   四道门（见文件头"误判防线"）：g2_on + walk_ver + 非受信 uid + 页确信缺失。
- *   拦截 = 返回 0（= 懒页空串的逐字节等价读法，页零副作用）。
- *   KP 拿到 len<=0 ⇒ return ⇒ skip_origin=0 ⇒ 原生 truncate 语义完整。
- * ========================================================================== */
-static long (*apk_orig_scfu)(char *dest, const char __user *src, long count);
-
-/* 在途计数：必须原子（多核同时进 stub，非原子读-改-写会丢计数 ⇒
- * 卸载排空提前通过 ⇒ 在途 stub 撞已释放 .text ⇒ 概率性 panic）。
- * ★ 不用 __atomic 系列 / __sync 系列（生成 libgcc 辅助调用 ⇒ KPM 加载失败），
- *   与 LH_Dr_KPM 相同用 ldaxr/stlxr 裸汇编。 */
-static inline void apk_atomic_inc(volatile int *p)
-{
-    int old, newv, ret;
-    asm volatile(
-        "1: ldaxr %w[old], %[mem]\n"
-        "   add   %w[new], %w[old], #1\n"
-        "   stlxr %w[ret], %w[new], %[mem]\n"
-        "   cbnz  %w[ret], 1b\n"
-        : [old] "=&r"(old), [new] "=&r"(newv), [ret] "=&r"(ret),
-          [mem] "+Q"(*p) :: "memory");
-}
-
-static inline void apk_atomic_dec(volatile int *p)
-{
-    int old, newv, ret;
-    asm volatile(
-        "1: ldaxr %w[old], %[mem]\n"
-        "   sub   %w[new], %w[old], #1\n"
-        "   stlxr %w[ret], %w[new], %[mem]\n"
-        "   cbnz  %w[ret], 1b\n"
-        : [old] "=&r"(old), [new] "=&r"(newv), [ret] "=&r"(ret),
-          [mem] "+Q"(*p) :: "memory");
-}
-
-static long (*apk_orig_scfu2)(char *dest, const char __user *src, long count);
-
-/* G2 拦截决策（两钩子目标共用）：
- *  - 受信 / 无 src / count 非 key 形 ⇒ 不拦
- *  - 已标定 + 页确信缺失 ⇒ 精确拦懒页 key 读（页侧信道），记 apk_n_g2
- *  - 白名单 fail-closed 模式（标定失败也硬堵）⇒ 记 apk_n_g2fc
- * 返回 1 表示应拦截（调用方负责计数日志与原子减）。 */
-static int apk_g2_should_block(uint32_t uid, const char __user *src, long count)
-{
-    if (apk_uid_trusted(uid) || !src || count <= 0 || count > APK_SCFU_KEY_LEN)
-        return 0;
-    if (apk_g2_on && apk_walk_ver &&
-        apk_user_page_absent((uint64_t)(uintptr_t)src)) {
-        apk_n_g2++;
-        return 1;
-    }
-    if (apk_g2_failclosed) {
-        apk_n_g2fc++;
-        return 1;
-    }
-    apk_n_g2o++;
-    return 0;
-}
-
-static long apk_g2_scfu(char *dest, const char __user *src, long count)
-{
-    long r;
-    uint32_t uid;
-
-    apk_atomic_inc((volatile int *)&apk_g2_inflight);
-    uid = (uint32_t)current_uid();
-    if (apk_g2_should_block(uid, src, count)) {
-        APK_LOG("g2 block uid=%u src=%llx g2=%u fc=%u\n", (unsigned)uid,
-                (unsigned long long)(uintptr_t)src,
-                (unsigned)apk_n_g2, (unsigned)apk_n_g2fc);
-        apk_atomic_dec((volatile int *)&apk_g2_inflight);
-        return 0;                         /* 空串 = 懒页等价读法，无泄漏 */
-    }
-    if (apk_orig_scfu)
-        r = apk_orig_scfu(dest, src, count);
-    else
-        r = -EFAULT;                     /* 理论不可达：orig 为空则不会装钩 */
-    apk_atomic_dec((volatile int *)&apk_g2_inflight);
-    return r;
-}
-
-/* 第二钩子目标（可选，ctl0 g2tgt=strncpy_from_user 启用）：
- * KP 当前 before() 只用 compat_strncpy_from_user，但未来若改用 64 位原语
- * 读 key，此目标兜住 item-7「其他读取原语」。独立 orig 链避免串链。
- * 默认不装（热路径风险），仅 KP 实际换原语后按需开启。 */
-static long apk_g2_scfu2(char *dest, const char __user *src, long count)
-{
-    long r;
-    uint32_t uid;
-
-    apk_atomic_inc((volatile int *)&apk_g2_inflight);
-    uid = (uint32_t)current_uid();
-    if (apk_g2_should_block(uid, src, count)) {
-        APK_LOG("g2 block2 uid=%u src=%llx g2=%u fc=%u\n", (unsigned)uid,
-                (unsigned long long)(uintptr_t)src,
-                (unsigned)apk_n_g2, (unsigned)apk_n_g2fc);
-        apk_atomic_dec((volatile int *)&apk_g2_inflight);
-        return 0;
-    }
-    if (apk_orig_scfu2)
-        r = apk_orig_scfu2(dest, src, count);
-    else
-        r = -EFAULT;
-    apk_atomic_dec((volatile int *)&apk_g2_inflight);
-    return r;
-}
-
-/* ========================== 净化：KP 泄漏值的原生语义 ========================== */
-static long apk_native_ret(void *fdata, uint64_t x0, uint64_t x1)
-{
-    /* 干净内核 truncate：length<0 在 getname 前返回 -EINVAL，
-     * 一个字节都不读 x0 ⇒ 同值返回，页侧信道零差异。 */
-    if ((long)x1 < 0)
-        return -EINVAL;
-
-    if (apk_orig45) {
-        /* wrapper 模式：transit 抓到的 args[0] 本身就是 pt_regs* 指针 */
-        if (has_syscall_wrapper)
-            return ((long (*)(struct pt_regs *))apk_orig45)(
-                (struct pt_regs *)((hook_fargs6_t *)fdata)->args[0]);
-        return ((long (*)(uint64_t, uint64_t))apk_orig45)(x0, x1);
-    }
-    return -ENOENT;
-}
-
-
-/* ---------------- nr45 before：KP supercall 钩子（链槽 0）之后 ---------------- */
-static void apk_sc45_before(hook_fargs6_t *fargs, void *udata)
-{
-    uint64_t *args;
-    uint64_t x0, x1, cmd;
-    uint32_t uid;
-    long kret;
-
-    (void)udata;
-
-    args = syscall_args(fargs);
-    x0 = args[0];
-    x1 = args[1];
-    cmd = x1 & 0xFFFF;
-
-    uid = (uint32_t)current_uid();
-
-    /* 首次进 nr45：oracle 武装（用调用者用户 PC 验证页表遍历正确性）。
-     * ★v2.1.1 修正 PAN 崩溃：transit 原始 fargs->args[0] 才是内核栈上的
-     *   pt_regs 指针；syscall_args() 解引用后的 args[0] 是**用户 x0**，
-     *   把它当 pt_regs* 读 ->pc 触发 "kernel access to user memory" Oops。
-     *   再叠加高半内核位校验，双重保险。非 wrapper 时 walk_ver 保持 0 ⇒
-     *   G2 永不拦截（fail-open，返回值通道不受影响）。 */
-    if (!apk_st_done && apk_walk_ok && !apk_walk_ver) {
-        apk_st_done = 1;
-        if (has_syscall_wrapper) {
-            uint64_t p = fargs->args[0];
-            if ((p >> 48) == 0xFFFF) {         /* 内核 VA 才允许解引用 */
-                struct pt_regs *regs = (struct pt_regs *)p;
-                uint64_t pc = regs->pc;
-                if (pc && pc < (1ULL << apk_ubits))
-                    apk_walk_sanity(pc);
-            }
-        } else {
-            APK_LOG("oracle: no wrapper -> G2 stays unarmed\n");
-        }
-    }
-
-    if (apk_trace)
-        APK_LOG("t uid=%u x1=%llx cmd=%llx skip=%d ret=%llx\n", (unsigned)uid,
-                (unsigned long long)x1, (unsigned long long)cmd,
-                (int)fargs->skip_origin, (unsigned long long)fargs->ret);
-
-    /* ---- KP 未认领（未鉴权且非受信）：原生 truncate 照跑，干净，不干预 ---- */
-    if (!fargs->skip_origin) {
-        apk_n_native++;
-        return;
-    }
-
-    /* ---- KP 已认领 ---- */
-    kret = (long)fargs->ret;
-
-    if (apk_uid_trusted(uid)) {
-        apk_n_pass++;
-        if (!apk_xx_learned) {
-            uint32_t ver = (uint32_t)(x1 >> 32);
-            uint32_t xx  = (uint32_t)((x1 >> 16) & 0xFFFFu);
-            if (ver != 0 && ver <= APK_VER_MAX && xx != 0) {
-                apk_xx_learned = xx;
-                APK_LOG("learned xx magic=0x%x from uid=%u\n", xx, (unsigned)uid);
-            }
-        }
-        return;                          /* 放行 KP 的结果（管理器全功能） */
-    }
-
-    /* ---- 未受信 + KP 认领：学习 或 净化 ---- */
-    if (apk_learn_on && apk_is_postgate_cmd(cmd) && kret >= 0) {
-        /* 鉴权门后命令 ret >= 0 ⇒ 真实通过 KP 鉴权（superkey/trusted_manager）
-         * —— 检测器无 key 永远做不到 ⇒ 判据不可伪造。 */
-        apk_learn_add(uid);
-        apk_n_learn++;
-        return;                          /* 首次调用即拿到正确结果 */
-    }
-
-    if (!apk_purify_on)
-        return;
-
-    /* 净化：KP 泄漏的 kpver/magic/-EPERM 改写为原生 truncate 语义 */
-    fargs->ret = (uint64_t)apk_native_ret(fargs, x0, x1);
-    apk_n_purify++;
-    APK_LOG("purify uid=%u cmd=0x%llx kret=%ld -> %ld\n",
-            (unsigned)uid, (unsigned long long)cmd, kret, (long)fargs->ret);
-}
-
-static void apk_sc45_after(hook_fargs6_t *fargs, void *udata)
-{
-    (void)fargs; (void)udata;
-}
-
-/* ==========================================================================
- * 三、KPM_CTL0
- * ========================================================================== */
-static int apk_str_prefix(const char *s, const char *p)
-{
-    while (*p) { if (*s++ != *p++) return 0; }
-    return 1;
-}
-
-static int apk_str_eq(const char *a, const char *b)
-{
-    while (*a && *a == *b) { a++; b++; }
-    return (unsigned char)*a == (unsigned char)*b;
-}
-
-static void apk_status_line(char *buf, int buflen)
-{
-    if (!buf || buflen <= 0) return;
-    buf[0] = '\0';
-    if (!apk_snprintf) return;
-
-    apk_snprintf(buf, (size_t)buflen,
-                 "APKey_Hide v2.1.4 hooked=%d learn=%d(ln=%d) purify=%d g2=%d "
-                 "fc=%d alw=%d xx=0x%x walk(ok=%d ver=%d lin=%llx u%d ps%d lv%d) "
-                 "cnt(pass=%u learn=%u pur=%u nat=%u abs=%u g2=%u g2o=%u g2fc=%u) o45=%llx",
-                 apk_hooked, apk_learn_on, apk_learn_n, apk_purify_on, apk_g2_on,
-                 apk_g2_failclosed, apk_allow_n, (unsigned)apk_xx_learned,
-                 apk_walk_ok, apk_walk_ver,
-                 (unsigned long long)apk_lin_off, apk_ubits, apk_ups, apk_ulevel,
-                 (unsigned)apk_n_pass, (unsigned)apk_n_learn,
-                 (unsigned)apk_n_purify, (unsigned)apk_n_native,
-                 (unsigned)apk_n_absent, (unsigned)apk_n_g2, (unsigned)apk_n_g2o,
-                 (unsigned)apk_n_g2fc,
-                 (unsigned long long)(uintptr_t)apk_orig45);
-    buf[buflen - 1] = '\0';
-}
-
-/* 前置声明：ctl0 的 g2tgt= 分支会调用，定义在下方安装段。 */
-static int apk_install_g2_extra(const char *name);
-
-long apk_ctl0(const char *args, char *__user out_msg, int outlen)
-{
-    char cmd[24];
-    char out[480];
-    int n = 0;
-
-    if (args) {
-        while (args[n] && n < (int)sizeof(cmd) - 1) {
-            cmd[n] = args[n];
-            n++;
-        }
-    }
-    cmd[n] = '\0';
-
-    if (n > 0) {
-        if (apk_str_prefix(cmd, "allow=")) {
-            const char *q = cmd + 6;
-            apk_allow_n = 0;
-            if (!(q[0] == 'n')) {
-                while (*q && apk_allow_n < APK_ALLOW_MAX) {
-                    uint32_t v = 0;
-                    while (*q >= '0' && *q <= '9')
-                        v = v * 10u + (uint32_t)(*q++ - '0');
-                    apk_allow[apk_allow_n++] = v;
-                    if (*q == ',') q++; else break;
-                }
-            }
-        } else if (apk_str_eq(cmd, "reset")) {
-            int i;
-            for (i = 0; i < APK_LEARN_MAX; i++) apk_learn_ids[i] = 0;
-            apk_learn_n = 0;
-            apk_xx_learned = 0;
-        } else if (apk_str_prefix(cmd, "learn=")) {
-            apk_learn_on = (cmd[6] == '1');
-            /* 关学习 + 已配白名单 ⇒ 进入白名单 fail-closed：标定失败也硬堵，
-             * 根治 item-3「G2 fail-open 永久旁路边」。学习模式则回到 fail-open。 */
-            if (!apk_learn_on && apk_allow_n > 0)
-                apk_g2_failclosed = 1;
-            else if (apk_learn_on)
-                apk_g2_failclosed = 0;
-        } else if (apk_str_prefix(cmd, "purify=")) {
-            apk_purify_on = (cmd[7] == '1');
-        } else if (apk_str_prefix(cmd, "g2=")) {
-            apk_g2_on = (cmd[3] == '1');
-        } else if (apk_str_prefix(cmd, "g2fc=")) {
-            apk_g2_failclosed = (cmd[5] == '1');
-        } else if (apk_str_prefix(cmd, "g2tgt=")) {
-            apk_install_g2_extra(cmd + 6);
-        } else if (apk_str_prefix(cmd, "trace=")) {
-            apk_trace = (cmd[6] == '1');
-        }
-    }
-
-    apk_status_line(out, (int)sizeof(out));
-    if (out_msg && outlen > 0 && apk_copy_to_user) {
-        int len = 0;
-        while (out[len] && len < outlen - 1) len++;
-        if (len > 0)
-            (void)apk_copy_to_user(out_msg, out, (unsigned long)(len + 1));
-    }
-    return 0;
-}
-
-KPM_CTL0(apk_ctl0);
-
-/* ==========================================================================
- * 四、安装 / 卸载
- * ========================================================================== */
-static void apk_resolve_orig45(void)
-{
-    apk_orig45 = (uintptr_t)kallsyms_lookup_name("__arm64_sys_truncate");
-    if (!apk_orig45)
-        apk_orig45 = (uintptr_t)kallsyms_lookup_name("__se_sys_truncate");
-    if (!apk_orig45)
-        apk_orig45 = (uintptr_t)kallsyms_lookup_name("__do_sys_truncate");
-    if (!apk_orig45)
-        apk_orig45 = (uintptr_t)kallsyms_lookup_name("SyS_truncate");
-    if (!apk_orig45)
-        apk_orig45 = (uintptr_t)kallsyms_lookup_name("sys_truncate");
-}
-
-/* 把 G2 inline hook 装到 KP 的 compat_strncpy_from_user 上。
- * hook/unhook/compat_strncpy_from_user 全部 extern（KP 导出表解析，
- * 见上方说明）。失败 ⇒ 永久降级 g2_on=0（返回值通道不受影响）。 */
-static int apk_install_g2(void)
-{
-    hook_err_t err;
-
-    err = hook((void *)compat_strncpy_from_user, (void *)apk_g2_scfu,
-               (void **)&apk_orig_scfu);
-    if (err || !apk_orig_scfu) {
-        APK_LOG("g2: hook failed err=%d -> off\n", (int)err);
-        apk_orig_scfu = 0;
-        return 0;
-    }
-    APK_LOG("g2: armed at scfu=%llx\n",
-            (unsigned long long)(uintptr_t)compat_strncpy_from_user);
-    return 1;
-}
-
-/* 可选第二目标：钩 strncpy_from_user（64 位原语）。仅 g2tgt= 显式开启。
- * 解出符号即用 hook() 接管，失败静默跳过（不降级主防护）。 */
-static int apk_install_g2_extra(const char *name)
-{
-    void *tgt;
-    hook_err_t err;
-
-    if (!name || !apk_str_eq(name, "strncpy_from_user"))
-        return -EINVAL;
-    if (apk_orig_scfu2) {                /* 已装，防重复 */
-        APK_LOG("g2tgt: already armed\n");
-        return 0;
-    }
-    tgt = (void *)kallsyms_lookup_name("strncpy_from_user");
-    if (!tgt) {
-        APK_LOG("g2tgt: strncpy_from_user not resolved -> skip\n");
-        return -ENOENT;
-    }
-    err = hook(tgt, (void *)apk_g2_scfu2, (void **)&apk_orig_scfu2);
-    if (err || !apk_orig_scfu2) {
-        APK_LOG("g2tgt: hook strncpy_from_user failed err=%d\n", (int)err);
-        apk_orig_scfu2 = 0;
-        return (int)err;
-    }
-    APK_LOG("g2tgt: armed strncpy_from_user at %llx\n",
-            (unsigned long long)(uintptr_t)tgt);
-    return 0;
-}
-
-static long apk_init(const char *args, const char *event, void *reserved)
-{
-    hook_err_t err;
-
-    (void)args; (void)event; (void)reserved;
-
-    /* ---- 运行时解析（缺失只降级，不影响加载） ---- */
-    apk_printk = (int (*)(const char *, ...))kallsyms_lookup_name("printk");
-    if (!apk_printk)
-        apk_printk = (int (*)(const char *, ...))kallsyms_lookup_name("_printk");
-    apk_snprintf = (int (*)(char *, size_t, const char *, ...))
-        kallsyms_lookup_name("scnprintf");
-    if (!apk_snprintf)
-        apk_snprintf = (int (*)(char *, size_t, const char *, ...))
-            kallsyms_lookup_name("snprintf");
-    apk_copy_to_user = (long (*)(void *, const void *, unsigned long))
-        kallsyms_lookup_name("copy_to_user");
-    if (!apk_copy_to_user)
-        apk_copy_to_user = (long (*)(void *, const void *, unsigned long))
-            kallsyms_lookup_name("_copy_to_user");
-    apk_nofault_r = (long (*)(void *, const void *, size_t))
-        kallsyms_lookup_name("copy_from_kernel_nofault");
-    if (!apk_nofault_r)
-        apk_nofault_r = (long (*)(void *, const void *, size_t))
-            kallsyms_lookup_name("probe_kernel_read");
-
-    apk_resolve_orig45();
-
-    /* ---- 页表标定（全程只读内核内存，零副作用） ---- */
-    apk_mair = apk_mrs_mair();
-    if (apk_nofault_r) {
-        apk_user_params_from_tcr();
-        apk_walk_ok = apk_calib_kimage();
-        if (!apk_walk_ok)
-            apk_walk_ok = apk_calib_kernel();
-    }
-
-    /* ---- G2 内联钩子（oracle 在首次 nr45 时武装） ---- */
-    if (apk_g2_on && apk_walk_ok)
-        apk_g2_installed = apk_install_g2();
-    if (!apk_g2_installed)
-        apk_g2_on = 0;
-
-    /* ---- nr45 链钩子（与 v2.0.1 相同、真机验证过的 API） ---- */
-    err = fp_hook_syscalln(APK_NR_SUPERCALL, 6,
-                           (void *)apk_sc45_before, (void *)apk_sc45_after, 0);
-    if (err) {
-        APK_LOG("fp_hook_syscalln(45) failed: %d\n", (int)err);
-        if (apk_g2_installed) {
-            unhook((void *)compat_strncpy_from_user);
-            apk_g2_installed = 0;
-            apk_g2_on = 0;
-        }
-        return -1;
-    }
-    apk_hooked = 1;
-
-    APK_LOG("init v2.1.3 done o45=%llx walk=%d g2=%d\n",
-            (unsigned long long)apk_orig45, apk_walk_ok, apk_g2_installed);
-    return 0;
-}
-
-static long apk_exit(void *reserved)
-{
-    unsigned long spins = 0;
-
-    (void)reserved;
-
-    /* 停机顺序：先摘最外层 nr45（不再产生新的 scfu 读取上下文），
-     * 再摘 G2 inline hook，排空在途 stub 后模块 .text 才可安全释放。 */
-    if (apk_hooked) {
-        fp_unhook_syscalln(APK_NR_SUPERCALL,
-                           (void *)apk_sc45_before, (void *)apk_sc45_after);
-        apk_hooked = 0;
-    }
-    if (apk_g2_installed) {
-        apk_g2_on = 0;
-        unhook((void *)compat_strncpy_from_user);
-        /* hook() 的 trampoline 备份在 apk_orig_scfu，unhook 即恢复原函数头；
-         * 再排空在途 stub（都在模块 .text 内，必须等它们退出） */
-        while (apk_g2_inflight != 0 && spins < APK_DRAIN_LOOPS)
-            spins++;
-        apk_g2_installed = 0;
-        apk_orig_scfu = 0;
-    }
-    APK_LOG("exit done\n");
-    return 0;
-}
-
-KPM_INIT(apk_init);
-KPM_EXIT(apk_exit);
