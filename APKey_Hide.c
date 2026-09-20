@@ -73,7 +73,7 @@
 #include <uapi/asm-generic/errno.h>
 
 KPM_NAME("APKey_Hide");
-KPM_VERSION("2.1.3");
+KPM_VERSION("2.1.4");
 KPM_LICENSE("MIT");
 KPM_AUTHOR("Lun.");
 KPM_DESCRIPTION("suppress KernelPatch supercall param-page reads;https://github.com/Lun-OS/APKey_Hide_KPM");
@@ -139,6 +139,7 @@ static int apk_learn_on = 1;   /* 学习型鉴权 */
 static int apk_purify_on = 1;  /* 返回值净化（通道 A） */
 static int apk_g2_on = 1;      /* 页守卫（通道 B；失败自动降级 0） */
 static int apk_trace;          /* ctl0 trace=1：nr45 现场记录（debug 版） */
+static int apk_g2_failclosed;  /* 白名单模式：标定失败也硬堵非受信 key 读（item-3） */
 
 /* ========================== 学习集合 ========================== */
 static uint32_t apk_learn_ids[APK_LEARN_MAX];
@@ -177,26 +178,53 @@ static int apk_uid_trusted(uint32_t u)
     return 0;
 }
 
-/* 鉴权门后的命令族：supercall.c 中全部 case 位于
+/* 鉴权门【前】的命令族：supercall.c 中全部 case 位于
  *   `if (!is_authed) return -EPERM;`
- * 之后 ⇒ 未鉴权必为负，ret >= 0 即不可伪造的管理器证明。
- * ★ HELLO(0x1000)/KLOG(0x1004)/VER(0x1007/0x1009)/SU 族(0x1100+) 在门前，
- *   绝不可作学习判据（会被检测器污染学习集）。 */
-static int apk_is_postgate_cmd(uint64_t cmd)
+ * 之前 ⇒ 未鉴权也能返回 >=0，绝不可作学习判据（会被检测器污染学习集）。
+ * 这些命令极稳定（hello/klog/ver/su），极少新增；而门【后】命令
+ * （KPM 管理、skey、未来特性）是 KP 功能面，会随版本增长。
+ * ★ v2.1.4 起改为**反转判据**：列出门前命令（deny 集），其余
+ *   [APK_CMD_MIN, APK_CMD_MAX] 内命令一律视为门后 ⇒ 任何新门后命令
+ *   自动被学习接纳，根治 item-6「命令表漂移漏学 / 误净化」。
+ *   若未来 KP 新增门前命令，必须在此 deny 集补上，否则会被误当门后学坏学习集。
+ *   值取自 patch/include/uapi/scdefs.h（已与真机 KP d03 对齐）。 */
+static int apk_is_pregate_cmd(uint64_t cmd)
 {
     switch (cmd) {
-    case 0x1020:  /* SUPERCALL_KPM_LOAD     成功返回 0 */
-    case 0x1021:  /* SUPERCALL_KPM_UNLOAD */
-    case 0x1022:  /* SUPERCALL_KPM_CONTROL */
-    case 0x1030:  /* SUPERCALL_KPM_NUMS     返回模块数 >= 1 */
-    case 0x1031:  /* SUPERCALL_KPM_LIST */
-    case 0x100a:  /* SUPERCALL_SKEY_GET */
-    case 0x100b:  /* SUPERCALL_SKEY_SET */
-    case 0x100c:  /* SUPERCALL_SKEY_ROOT_ENABLE */
+    /* ---- 第一开关（恒门前） ---- */
+    case 0x1000:  /* SUPERCALL_HELLO */
+    case 0x1004:  /* SUPERCALL_KLOG */
+    case 0x1007:  /* SUPERCALL_BUILD_TIME */
+    case 0x1008:  /* SUPERCALL_KERNELPATCH_VER */
+    case 0x1009:  /* SUPERCALL_KERNEL_VER */
+    case 0x100d:  /* SUPERCALL_AP_LOAD_PACKAGE_CONFIG */
+    /* ---- 第二开关 SU 族（门前） ---- */
+    case 0x1010:  /* SUPERCALL_SU */
+    case 0x1011:  /* SUPERCALL_SU_TASK */
+    case 0x1100:  /* SUPERCALL_SU_GRANT_UID */
+    case 0x1101:  /* SUPERCALL_SU_REVOKE_UID */
+    case 0x1102:  /* SUPERCALL_SU_NUMS */
+    case 0x1103:  /* SUPERCALL_SU_LIST */
+    case 0x1104:  /* SUPERCALL_SU_PROFILE */
+    case 0x1105:  /* SUPERCALL_SU_GET_ALLOW_SCTX */
+    case 0x1106:  /* SUPERCALL_SU_SET_ALLOW_SCTX */
+    case 0x1110:  /* SUPERCALL_SU_GET_PATH */
+    case 0x1111:  /* SUPERCALL_SU_RESET_PATH */
+    case 0x1112:  /* SUPERCALL_SU_GET_SAFEMODE */
         return 1;
     default:
         return 0;
     }
+}
+
+/* 门后命令判据（反转）：在 supercall 命令区间内、且不在门前 deny 集 ⇒ 门后。
+ * 门后命令 ret>=0 即真实通过 KP 鉴权（superkey/trusted_manager），
+ * 检测器无 key 永远做不到 ⇒ 判据不可伪造。 */
+static int apk_is_postgate_cmd(uint64_t cmd)
+{
+    if (cmd < APK_CMD_MIN || cmd > APK_CMD_MAX)
+        return 0;
+    return !apk_is_pregate_cmd(cmd);
 }
 
 /* ========================== 运行时解析符号 ============ */
@@ -222,6 +250,7 @@ static volatile uint32_t apk_n_native;  /* KP 未认领，原生执行 */
 static volatile uint32_t apk_n_absent;  /* 页研判：确信缺失 */
 static volatile uint32_t apk_n_g2;      /* G2 拦截次数 */
 static volatile uint32_t apk_n_g2o;     /* G2 放行次数（present/受信） */
+static volatile uint32_t apk_n_g2fc;    /* G2 fail-closed 硬堵次数（标定失败也堵） */
 
 /* 钩子状态 */
 static int apk_hooked;
@@ -247,11 +276,7 @@ static inline uint64_t apk_phys_mask(int shift)
 }
 
 
-
-
 /*
-
-
                ............................ ............. :................................         
              ............................ :. ............ -.................................        
             ............. ................=.............. =: ................. ...............      
@@ -303,12 +328,8 @@ static inline uint64_t apk_phys_mask(int shift)
          ...... ...+=@@@.          .@@@@@@@@@@@@@@@@@@@@@@@@@@+           %@@@@@@%- ...   ...       
           ....... -@@@@@.          .@@@@@@@@@@@@@@@@@@@@@@@@@@*           %@@@@@@@@- ........       
 
-我也要被检测吗
-
+          我也要被检测吗
 */
-
-
-
 
 /* 解析 va 叶子描述符；0 = present（用户映射、非 Device） */
 static int apk_walk(uint64_t pgd_va, uint64_t va, int ps, int level, int require_user,
@@ -728,31 +749,74 @@ static inline void apk_atomic_dec(volatile int *p)
           [mem] "+Q"(*p) :: "memory");
 }
 
+static long (*apk_orig_scfu2)(char *dest, const char __user *src, long count);
+
+/* G2 拦截决策（两钩子目标共用）：
+ *  - 受信 / 无 src / count 非 key 形 ⇒ 不拦
+ *  - 已标定 + 页确信缺失 ⇒ 精确拦懒页 key 读（页侧信道），记 apk_n_g2
+ *  - 白名单 fail-closed 模式（标定失败也硬堵）⇒ 记 apk_n_g2fc
+ * 返回 1 表示应拦截（调用方负责计数日志与原子减）。 */
+static int apk_g2_should_block(uint32_t uid, const char __user *src, long count)
+{
+    if (apk_uid_trusted(uid) || !src || count <= 0 || count > APK_SCFU_KEY_LEN)
+        return 0;
+    if (apk_g2_on && apk_walk_ver &&
+        apk_user_page_absent((uint64_t)(uintptr_t)src)) {
+        apk_n_g2++;
+        return 1;
+    }
+    if (apk_g2_failclosed) {
+        apk_n_g2fc++;
+        return 1;
+    }
+    apk_n_g2o++;
+    return 0;
+}
+
 static long apk_g2_scfu(char *dest, const char __user *src, long count)
 {
-    uint32_t uid;
     long r;
+    uint32_t uid;
 
     apk_atomic_inc((volatile int *)&apk_g2_inflight);
-
-    if (apk_g2_on && apk_walk_ver) {
-        uid = (uint32_t)current_uid();
-        if (!apk_uid_trusted(uid) && src && count > 0 &&
-            count <= APK_SCFU_KEY_LEN &&
-            apk_user_page_absent((uint64_t)(uintptr_t)src)) {
-            apk_n_g2++;
-            APK_LOG("g2 block uid=%u src=%llx n=%u\n", (unsigned)uid,
-                    (unsigned long long)(uintptr_t)src, (unsigned)apk_n_g2);
-            apk_atomic_dec((volatile int *)&apk_g2_inflight);
-            return 0;
-        }
-        apk_n_g2o++;
+    uid = (uint32_t)current_uid();
+    if (apk_g2_should_block(uid, src, count)) {
+        APK_LOG("g2 block uid=%u src=%llx g2=%u fc=%u\n", (unsigned)uid,
+                (unsigned long long)(uintptr_t)src,
+                (unsigned)apk_n_g2, (unsigned)apk_n_g2fc);
+        apk_atomic_dec((volatile int *)&apk_g2_inflight);
+        return 0;                         /* 空串 = 懒页等价读法，无泄漏 */
     }
-
     if (apk_orig_scfu)
         r = apk_orig_scfu(dest, src, count);
     else
         r = -EFAULT;                     /* 理论不可达：orig 为空则不会装钩 */
+    apk_atomic_dec((volatile int *)&apk_g2_inflight);
+    return r;
+}
+
+/* 第二钩子目标（可选，ctl0 g2tgt=strncpy_from_user 启用）：
+ * KP 当前 before() 只用 compat_strncpy_from_user，但未来若改用 64 位原语
+ * 读 key，此目标兜住 item-7「其他读取原语」。独立 orig 链避免串链。
+ * 默认不装（热路径风险），仅 KP 实际换原语后按需开启。 */
+static long apk_g2_scfu2(char *dest, const char __user *src, long count)
+{
+    long r;
+    uint32_t uid;
+
+    apk_atomic_inc((volatile int *)&apk_g2_inflight);
+    uid = (uint32_t)current_uid();
+    if (apk_g2_should_block(uid, src, count)) {
+        APK_LOG("g2 block2 uid=%u src=%llx g2=%u fc=%u\n", (unsigned)uid,
+                (unsigned long long)(uintptr_t)src,
+                (unsigned)apk_n_g2, (unsigned)apk_n_g2fc);
+        apk_atomic_dec((volatile int *)&apk_g2_inflight);
+        return 0;
+    }
+    if (apk_orig_scfu2)
+        r = apk_orig_scfu2(dest, src, count);
+    else
+        r = -EFAULT;
     apk_atomic_dec((volatile int *)&apk_g2_inflight);
     return r;
 }
@@ -887,19 +951,23 @@ static void apk_status_line(char *buf, int buflen)
     if (!apk_snprintf) return;
 
     apk_snprintf(buf, (size_t)buflen,
-                 "APKey_Hide v2.1.3 hooked=%d learn=%d(ln=%d) purify=%d g2=%d "
-                 "alw=%d xx=0x%x walk(ok=%d ver=%d lin=%llx u%d ps%d lv%d) "
-                 "cnt(pass=%u learn=%u pur=%u nat=%u abs=%u g2=%u g2o=%u) o45=%llx",
+                 "APKey_Hide v2.1.4 hooked=%d learn=%d(ln=%d) purify=%d g2=%d "
+                 "fc=%d alw=%d xx=0x%x walk(ok=%d ver=%d lin=%llx u%d ps%d lv%d) "
+                 "cnt(pass=%u learn=%u pur=%u nat=%u abs=%u g2=%u g2o=%u g2fc=%u) o45=%llx",
                  apk_hooked, apk_learn_on, apk_learn_n, apk_purify_on, apk_g2_on,
-                 apk_allow_n, (unsigned)apk_xx_learned,
+                 apk_g2_failclosed, apk_allow_n, (unsigned)apk_xx_learned,
                  apk_walk_ok, apk_walk_ver,
                  (unsigned long long)apk_lin_off, apk_ubits, apk_ups, apk_ulevel,
                  (unsigned)apk_n_pass, (unsigned)apk_n_learn,
                  (unsigned)apk_n_purify, (unsigned)apk_n_native,
                  (unsigned)apk_n_absent, (unsigned)apk_n_g2, (unsigned)apk_n_g2o,
+                 (unsigned)apk_n_g2fc,
                  (unsigned long long)(uintptr_t)apk_orig45);
     buf[buflen - 1] = '\0';
 }
+
+/* 前置声明：ctl0 的 g2tgt= 分支会调用，定义在下方安装段。 */
+static int apk_install_g2_extra(const char *name);
 
 long apk_ctl0(const char *args, char *__user out_msg, int outlen)
 {
@@ -935,10 +1003,20 @@ long apk_ctl0(const char *args, char *__user out_msg, int outlen)
             apk_xx_learned = 0;
         } else if (apk_str_prefix(cmd, "learn=")) {
             apk_learn_on = (cmd[6] == '1');
+            /* 关学习 + 已配白名单 ⇒ 进入白名单 fail-closed：标定失败也硬堵，
+             * 根治 item-3「G2 fail-open 永久旁路边」。学习模式则回到 fail-open。 */
+            if (!apk_learn_on && apk_allow_n > 0)
+                apk_g2_failclosed = 1;
+            else if (apk_learn_on)
+                apk_g2_failclosed = 0;
         } else if (apk_str_prefix(cmd, "purify=")) {
             apk_purify_on = (cmd[7] == '1');
         } else if (apk_str_prefix(cmd, "g2=")) {
             apk_g2_on = (cmd[3] == '1');
+        } else if (apk_str_prefix(cmd, "g2fc=")) {
+            apk_g2_failclosed = (cmd[5] == '1');
+        } else if (apk_str_prefix(cmd, "g2tgt=")) {
+            apk_install_g2_extra(cmd + 6);
         } else if (apk_str_prefix(cmd, "trace=")) {
             apk_trace = (cmd[6] == '1');
         }
@@ -989,6 +1067,35 @@ static int apk_install_g2(void)
     APK_LOG("g2: armed at scfu=%llx\n",
             (unsigned long long)(uintptr_t)compat_strncpy_from_user);
     return 1;
+}
+
+/* 可选第二目标：钩 strncpy_from_user（64 位原语）。仅 g2tgt= 显式开启。
+ * 解出符号即用 hook() 接管，失败静默跳过（不降级主防护）。 */
+static int apk_install_g2_extra(const char *name)
+{
+    void *tgt;
+    hook_err_t err;
+
+    if (!name || !apk_str_eq(name, "strncpy_from_user"))
+        return -EINVAL;
+    if (apk_orig_scfu2) {                /* 已装，防重复 */
+        APK_LOG("g2tgt: already armed\n");
+        return 0;
+    }
+    tgt = (void *)kallsyms_lookup_name("strncpy_from_user");
+    if (!tgt) {
+        APK_LOG("g2tgt: strncpy_from_user not resolved -> skip\n");
+        return -ENOENT;
+    }
+    err = hook(tgt, (void *)apk_g2_scfu2, (void **)&apk_orig_scfu2);
+    if (err || !apk_orig_scfu2) {
+        APK_LOG("g2tgt: hook strncpy_from_user failed err=%d\n", (int)err);
+        apk_orig_scfu2 = 0;
+        return (int)err;
+    }
+    APK_LOG("g2tgt: armed strncpy_from_user at %llx\n",
+            (unsigned long long)(uintptr_t)tgt);
+    return 0;
 }
 
 static long apk_init(const char *args, const char *event, void *reserved)
